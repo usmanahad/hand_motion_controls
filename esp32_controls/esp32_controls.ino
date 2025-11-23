@@ -3,9 +3,6 @@
 #include "esp_camera.h"
 #include "esp_http_server.h"
 
-// Lightweight OpenCV-like functions for ESP32
-// We'll implement our own since full OpenCV is too heavy
-
 const char* ssid = "LUMS-Events";
 const char* password = "Epple@2025";
 
@@ -30,12 +27,45 @@ httpd_handle_t camera_httpd = NULL;
 #define HREF_GPIO_NUM     7
 #define PCLK_GPIO_NUM     13
 
-// HSV Color space structure
-struct HSV {
-  uint8_t h, s, v;
-};
+// ====== DATA STRUCTURES ======
 
-// Convert RGB to HSV
+typedef struct {
+  uint8_t h, s, v;
+} HSV;
+
+typedef struct {
+  int cx, cy;
+  int area;
+  bool valid;
+} Blob;
+
+// ====== FUNCTION DECLARATIONS ======
+
+HSV rgb_to_hsv(uint8_t r, uint8_t g, uint8_t b);
+void erode(uint8_t* mask, int width, int height, int kernel_size);
+void dilate(uint8_t* mask, int width, int height, int kernel_size);
+Blob find_largest_blob(uint8_t* mask, int width, int height);
+Blob detect_white_glove_hsv(camera_fb_t* fb);
+void process_controls(int x, int y, int width, int height);
+void startCameraServer();
+static esp_err_t stream_handler(httpd_req_t *req);
+
+// ====== GLOBAL VARIABLES ======
+
+#define BUFFER_SIZE 5
+int pos_buffer_x[BUFFER_SIZE] = {0};
+int pos_buffer_y[BUFFER_SIZE] = {0};
+int buffer_index = 0;
+int buffer_count = 0;
+
+bool move_forward = false;
+bool move_backward = false;
+bool turn_left = false;
+bool turn_right = false;
+bool shoot = false;
+
+// ====== FUNCTION IMPLEMENTATIONS ======
+
 HSV rgb_to_hsv(uint8_t r, uint8_t g, uint8_t b) {
   HSV hsv;
   
@@ -47,7 +77,6 @@ HSV rgb_to_hsv(uint8_t r, uint8_t g, uint8_t b) {
   float min_val = min(min(rf, gf), bf);
   float delta = max_val - min_val;
   
-  // Hue calculation
   if (delta == 0) {
     hsv.h = 0;
   } else if (max_val == rf) {
@@ -58,27 +87,17 @@ HSV rgb_to_hsv(uint8_t r, uint8_t g, uint8_t b) {
     hsv.h = (uint8_t)(30 * ((rf - gf) / delta + 4));
   }
   
-  // Saturation calculation
   if (max_val == 0) {
     hsv.s = 0;
   } else {
     hsv.s = (uint8_t)(255 * delta / max_val);
   }
   
-  // Value calculation
   hsv.v = (uint8_t)(255 * max_val);
   
   return hsv;
 }
 
-// Blob detection structure
-struct Blob {
-  int cx, cy;      // Center
-  int area;        // Area
-  bool valid;
-};
-
-// OpenCV-like morphological operations
 void erode(uint8_t* mask, int width, int height, int kernel_size = 3) {
   uint8_t* temp = (uint8_t*)malloc(width * height);
   if (!temp) return;
@@ -91,7 +110,6 @@ void erode(uint8_t* mask, int width, int height, int kernel_size = 3) {
     for (int x = half_k; x < width - half_k; x++) {
       bool all_white = true;
       
-      // Check kernel
       for (int ky = -half_k; ky <= half_k; ky++) {
         for (int kx = -half_k; kx <= half_k; kx++) {
           if (temp[(y + ky) * width + (x + kx)] == 0) {
@@ -121,7 +139,6 @@ void dilate(uint8_t* mask, int width, int height, int kernel_size = 3) {
     for (int x = half_k; x < width - half_k; x++) {
       bool any_white = false;
       
-      // Check kernel
       for (int ky = -half_k; ky <= half_k; ky++) {
         for (int kx = -half_k; kx <= half_k; kx++) {
           if (temp[(y + ky) * width + (x + kx)] == 255) {
@@ -139,16 +156,18 @@ void dilate(uint8_t* mask, int width, int height, int kernel_size = 3) {
   free(temp);
 }
 
-// Blob detection (simplified connected components)
 Blob find_largest_blob(uint8_t* mask, int width, int height) {
-  Blob blob = {0, 0, 0, false};
+  Blob blob;
+  blob.cx = 0;
+  blob.cy = 0;
+  blob.area = 0;
+  blob.valid = false;
   
   long sum_x = 0, sum_y = 0, count = 0;
   
-  // Simple centroid calculation
   for (int y = 0; y < height; y++) {
     for (int x = 0; x < width; x++) {
-      if (mask[y * width + x] == 255) {
+      if (mask[y * width + x] >= 100) {
         sum_x += x;
         sum_y += y;
         count++;
@@ -156,7 +175,7 @@ Blob find_largest_blob(uint8_t* mask, int width, int height) {
     }
   }
   
-  if (count > 500) {  // Minimum area threshold
+  if (count > 50) {
     blob.cx = sum_x / count;
     blob.cy = sum_y / count;
     blob.area = count;
@@ -166,9 +185,12 @@ Blob find_largest_blob(uint8_t* mask, int width, int height) {
   return blob;
 }
 
-// Hand detection using HSV color space (OpenCV-like)
 Blob detect_white_glove_hsv(camera_fb_t* fb) {
-  Blob blob = {0, 0, 0, false};
+  Blob blob;
+  blob.cx = 0;
+  blob.cy = 0;
+  blob.area = 0;
+  blob.valid = false;
   
   if (!fb || fb->format != PIXFORMAT_RGB565) {
     return blob;
@@ -178,34 +200,27 @@ Blob detect_white_glove_hsv(camera_fb_t* fb) {
   int height = fb->height;
   uint16_t* pixels = (uint16_t*)fb->buf;
   
-  // Allocate mask
   uint8_t* mask = (uint8_t*)malloc(width * height);
   if (!mask) {
     Serial.println("Failed to allocate mask!");
     return blob;
   }
   
-  // HSV thresholds for white (adjustable)
-  // White in HSV: Low saturation, High value
   uint8_t h_low = 0, h_high = 180;
-  uint8_t s_low = 0, s_high = 30;    // Low saturation
-  uint8_t v_low = 200, v_high = 255;  // High brightness
+  uint8_t s_low = 0, s_high = 30;
+  uint8_t v_low = 200, v_high = 255;
   
-  // Convert to HSV and create mask
   for (int y = 0; y < height; y++) {
     for (int x = 0; x < width; x++) {
       int idx = y * width + x;
       uint16_t pixel = pixels[idx];
       
-      // Extract RGB
       uint8_t r = ((pixel >> 11) & 0x1F) * 255 / 31;
       uint8_t g = ((pixel >> 5) & 0x3F) * 255 / 63;
       uint8_t b = (pixel & 0x1F) * 255 / 31;
       
-      // Convert to HSV
       HSV hsv = rgb_to_hsv(r, g, b);
       
-      // Check if in white range
       if (hsv.h >= h_low && hsv.h <= h_high &&
           hsv.s >= s_low && hsv.s <= s_high &&
           hsv.v >= v_low && hsv.v <= v_high) {
@@ -216,29 +231,14 @@ Blob detect_white_glove_hsv(camera_fb_t* fb) {
     }
   }
   
-  // Morphological operations to clean up
   erode(mask, width, height, 5);
   dilate(mask, width, height, 5);
   
-  // Find largest blob
   blob = find_largest_blob(mask, width, height);
   
   free(mask);
   return blob;
 }
-
-// Smoothing buffer
-#define BUFFER_SIZE 5
-int pos_buffer_x[BUFFER_SIZE] = {0};
-int pos_buffer_y[BUFFER_SIZE] = {0};
-int buffer_index = 0;
-int buffer_count = 0;
-
-bool move_forward = false;
-bool move_backward = false;
-bool turn_left = false;
-bool turn_right = false;
-bool shoot = false;
 
 void process_controls(int x, int y, int width, int height) {
   pos_buffer_x[buffer_index] = x;
@@ -392,7 +392,7 @@ void setup() {
   config.pin_reset = RESET_GPIO_NUM;
   config.xclk_freq_hz = 20000000;
   config.pixel_format = PIXFORMAT_JPEG;
-  config.frame_size = FRAMESIZE_QVGA;  // 320x240
+  config.frame_size = FRAMESIZE_QVGA;
   config.jpeg_quality = 12;
   config.fb_location = CAMERA_FB_IN_PSRAM;
   config.fb_count = 2;
@@ -440,7 +440,6 @@ void loop() {
     return;
   }
   
-  // Use OpenCV-like HSV detection
   Blob blob = detect_white_glove_hsv(fb);
   
   if (millis() - last_debug > 2000) {
