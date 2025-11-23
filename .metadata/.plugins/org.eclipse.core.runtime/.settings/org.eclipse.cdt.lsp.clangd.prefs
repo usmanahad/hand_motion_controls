@@ -1,0 +1,4 @@
+additional_options=--compile-commands-dir\=/Users/usmanahad/Desktop/esp32-project/simple/build
+clangd_path=/Users/usmanahad/.espressif/tools/esp-clang/esp-19.1.2_20250312/esp-clang/bin/clangd
+eclipse.preferences.version=1
+query_driver=/Users/usmanahad/.espressif/tools/xtensa-esp-elf/esp-14.2.0_20241119/xtensa-esp-elf/bin/xtensa-esp32s3-elf-gcc

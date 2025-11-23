@@ -1,0 +1,190 @@
+#include <string.h>
+#include <stdlib.h>
+#include <unistd.h>
+#include <esp_log.h>
+#include <nvs_flash.h>
+#include <sys/param.h>
+#include "esp_netif.h"
+#include "esp_event.h"
+#include "esp_wifi.h"
+#include "esp_http_server.h"
+#include "esp_system.h"
+
+static const char *TAG = "esp32_doom";
+
+uint8_t *frame_buffer = NULL;
+size_t frame_size = 0;
+
+/* --------------------------------------------------------------------------
+   Dummy JPEG Generator
+   -------------------------------------------------------------------------- */
+size_t dummy_generate_jpeg(uint8_t *buf, size_t max)
+{
+    const uint8_t jpeg_stub[] = {
+        0xFF, 0xD8,  // SOI
+        0xFF, 0xD9   // EOI
+    };
+
+    size_t s = sizeof(jpeg_stub);
+    if (s > max) return 0;
+
+    memcpy(buf, jpeg_stub, s);
+    return s;
+}
+
+/* --------------------------------------------------------------------------
+   WiFi Event Handler
+   -------------------------------------------------------------------------- */
+
+static void wifi_event_handler(void *arg, esp_event_base_t event_base,
+                               int32_t event_id, void *event_data)
+{
+    if (event_base == WIFI_EVENT && event_id == WIFI_EVENT_STA_START) {
+        ESP_LOGI(TAG, "WiFi started, connecting...");
+        esp_wifi_connect();
+    }
+    else if (event_base == WIFI_EVENT && event_id == WIFI_EVENT_STA_CONNECTED) {
+        ESP_LOGI(TAG, "WiFi connected to AP");
+    }
+    else if (event_base == IP_EVENT && event_id == IP_EVENT_STA_GOT_IP) {
+        ip_event_got_ip_t *event = (ip_event_got_ip_t *)event_data;
+        ESP_LOGI(TAG, "Got IP: " IPSTR, IP2STR(&event->ip_info.ip));
+    }
+}
+
+/* --------------------------------------------------------------------------
+   WiFi Init
+   -------------------------------------------------------------------------- */
+
+static void wifi_init_sta(void)
+{
+    ESP_LOGI(TAG, "Initializing WiFi...");
+
+    esp_netif_create_default_wifi_sta();
+
+    wifi_init_config_t cfg = WIFI_INIT_CONFIG_DEFAULT();
+    ESP_ERROR_CHECK(esp_wifi_init(&cfg));
+
+    ESP_ERROR_CHECK(esp_event_handler_register(WIFI_EVENT, ESP_EVENT_ANY_ID, &wifi_event_handler, NULL));
+    ESP_ERROR_CHECK(esp_event_handler_register(IP_EVENT, IP_EVENT_STA_GOT_IP, &wifi_event_handler, NULL));
+
+    wifi_config_t wifi_config = {
+        .sta = {
+            .ssid = "Optix-504J",
+            .password = "optix123",
+            .threshold.authmode = WIFI_AUTH_WPA2_PSK,
+        },
+    };
+
+    ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_STA));
+    ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_STA, &wifi_config));
+
+    ESP_LOGI(TAG, "Starting WiFi...");
+    ESP_ERROR_CHECK(esp_wifi_start());
+}
+
+/* --------------------------------------------------------------------------
+   HTTP Handlers
+   -------------------------------------------------------------------------- */
+
+static esp_err_t frame_handler(httpd_req_t *req)
+{
+    ESP_LOGI(TAG, "Frame requested (%d bytes)", frame_size);
+    httpd_resp_set_type(req, "image/jpeg");
+    return httpd_resp_send(req, (const char*)frame_buffer, frame_size);
+}
+
+static const httpd_uri_t frame_uri = {
+    .uri = "/frame",
+    .method = HTTP_GET,
+    .handler = frame_handler,
+    .user_ctx = NULL,
+};
+
+static const char index_html[] =
+    "<html><body style='margin:0;padding:0;background:black;'>"
+    "<img id='v' style='width:100%;height:auto;'/>"
+    "<script>"
+    "setInterval(()=>{document.getElementById('v').src='/frame?d='+Date.now()},50);"
+    "</script>"
+    "</body></html>";
+
+static esp_err_t index_handler(httpd_req_t *req)
+{
+    ESP_LOGI(TAG, "Index page requested");
+    httpd_resp_set_type(req, "text/html");
+    return httpd_resp_send(req, index_html, strlen(index_html));
+}
+
+static const httpd_uri_t index_uri = {
+    .uri = "/",
+    .method = HTTP_GET,
+    .handler = index_handler,
+    .user_ctx = NULL,
+};
+
+/* --------------------------------------------------------------------------
+   Webserver
+   -------------------------------------------------------------------------- */
+
+static httpd_handle_t start_webserver(void)
+{
+    httpd_handle_t server = NULL;
+    httpd_config_t config = HTTPD_DEFAULT_CONFIG();
+    config.lru_purge_enable = true;
+
+    ESP_LOGI(TAG, "Starting webserver on port %d...", config.server_port);
+
+    if (httpd_start(&server, &config) == ESP_OK) {
+        httpd_register_uri_handler(server, &index_uri);
+        httpd_register_uri_handler(server, &frame_uri);
+        ESP_LOGI(TAG, "Webserver started");
+        return server;
+    }
+
+    ESP_LOGE(TAG, "Failed to start webserver");
+    return NULL;
+}
+
+/* --------------------------------------------------------------------------
+   Rendering Task
+   -------------------------------------------------------------------------- */
+
+void render_task(void *p)
+{
+    ESP_LOGI(TAG, "Render task started");
+
+    while (1) {
+        frame_size = dummy_generate_jpeg(frame_buffer, 100 * 100 * 3);
+        ESP_LOGI(TAG, "Generated frame (%d bytes)", frame_size);
+        vTaskDelay(pdMS_TO_TICKS(1000));
+    }
+}
+
+/* --------------------------------------------------------------------------
+   Main
+   -------------------------------------------------------------------------- */
+
+void app_main(void)
+{
+    ESP_LOGI(TAG, "Booting application...");
+
+    ESP_ERROR_CHECK(nvs_flash_init());
+    ESP_ERROR_CHECK(esp_netif_init());
+    ESP_ERROR_CHECK(esp_event_loop_create_default());
+
+    ESP_LOGI(TAG, "System init complete");
+
+    wifi_init_sta();
+
+    ESP_LOGI(TAG, "Allocating frame buffer...");
+    frame_buffer = malloc(100 * 100 * 3);
+
+    ESP_LOGI(TAG, "Starting render task...");
+    xTaskCreate(render_task, "render", 4096, NULL, 5, NULL);
+
+    ESP_LOGI(TAG, "Starting webserver...");
+    start_webserver();
+
+    ESP_LOGI(TAG, "Setup complete. Running...");
+}
